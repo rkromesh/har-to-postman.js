@@ -54,10 +54,39 @@ const STANDARD_RESPONSE_HEADERS = new Set([
 ]);
 
 const BUSINESS_HEADER_HINTS = [
-  'authorization', 'x-api-key', 'api-key', 'apikey', 'token',
-  'x-auth', 'x-access-token', 'x-csrf', 'x-xsrf', 'x-tenant',
-  'x-client', 'x-app', 'x-user', 'x-request', 'x-correl',
-  'x-trace', 'x-b3', 'saml', 'bearer', 'session',
+  'authorization',
+  'x-api-key',
+  'api-key',
+  'apikey',
+  'token',
+  'x-auth',
+  'x-access-token',
+  'x-csrf',
+  'x-xsrf',
+  'x-tenant',
+  'x-client',
+  'x-app',
+  'x-user',
+  'x-request',
+  'x-correl',
+  'x-trace',
+  'x-b3',
+  'saml',
+  'bearer',
+  'session',
+
+  // Insurance / Business specific
+  'endorsement',
+  'policy',
+  'insurance',
+  'tenant',
+  'customer',
+  'account',
+  'broker',
+  'agency',
+  'insured',
+  'coverage',
+  'premium'
 ];
 
 /* ------------------------------ Utilities ------------------------------ */
@@ -65,16 +94,47 @@ const BUSINESS_HEADER_HINTS = [
 function splitHeaders(arr, type = 'request') {
   const standard = {};
   const business = {};
+
   (arr || []).forEach((h) => {
-    const n = (h.name || '').toLowerCase();
-    const isStd = type === 'request'
-      ? STANDARD_REQUEST_HEADERS.has(n)
-      : STANDARD_RESPONSE_HEADERS.has(n);
-    if (isStd) standard[h.name] = h.value;
-    else business[h.name] = h.value;
+
+    const headerName = String(h.name || '').trim();
+    const value = h.value || '';
+
+    if (!headerName) {
+      return;
+    }
+
+    const lowerName = headerName.toLowerCase();
+
+    const explicitBusinessHeader =
+      lowerName.startsWith('endorsement-') ||
+      lowerName.startsWith('x-') ||
+      BUSINESS_HEADER_HINTS.some(hint =>
+        lowerName.includes(hint)
+      );
+
+    const isStandard =
+      type === 'request'
+        ? STANDARD_REQUEST_HEADERS.has(lowerName)
+        : STANDARD_RESPONSE_HEADERS.has(lowerName);
+
+    if (explicitBusinessHeader) {
+      business[headerName] = value;
+    }
+    else if (isStandard) {
+      standard[headerName] = value;
+    }
+    else {
+      business[headerName] = value;
+    }
   });
-  return { standard, business };
+
+  return {
+    standard,
+    business
+  };
 }
+
 
 function safeJsonParse(str) {
   try { return JSON.parse(str); } catch { return null; }
@@ -89,6 +149,34 @@ function truncate(str, n) {
   if (str == null) return '';
   const s = String(str);
   return s.length > n ? s.slice(0, n) + '…' : s;
+}
+
+function maskSensitiveHeaders(headers) {
+
+  const result = {};
+
+  Object.entries(headers || {}).forEach(([key, value]) => {
+
+    const lower = key.toLowerCase();
+
+    if (lower === 'authorization') {
+      result[key] = 'Bearer Token';
+    }
+    else if (lower === 'cookie') {
+      result[key] = 'Masked';
+    }
+    else if (
+      lower.includes('token') ||
+      lower.includes('jwt')
+    ) {
+      result[key] = 'Masked';
+    }
+    else {
+      result[key] = value;
+    }
+  });
+
+  return result;
 }
 
 function slugify(s) {
@@ -207,7 +295,20 @@ function buildReportRows(har) {
     let parsed;
     try { parsed = new URL(url); } catch { parsed = { origin: '', pathname: url, search: '' }; }
 
-    const { standard: stdReqH, business: bizReqH } = splitHeaders(req.headers, 'request');
+    const { standard: stdReqH, business: bizReqHRaw } = splitHeaders(req.headers, 'request');
+
+	const bizReqH = maskSensitiveHeaders(bizReqHRaw);
+	const endorsementHeaders = {};
+
+		Object.entries(bizReqH).forEach(([key, value]) => {
+
+		  if (
+			key.toLowerCase()
+			  .startsWith('endorsement-')
+		  ) {
+			endorsementHeaders[key] = value;
+		  }
+		});
     const { standard: stdResH, business: bizResH } = splitHeaders(res.headers, 'response');
 
     const reqBody = (req.postData && req.postData.text) || '';
@@ -224,6 +325,7 @@ function buildReportRows(har) {
       status: res.status || '',
       statusText: res.statusText || '',
       contentType: mime,
+	  endorsementHeaders:JSON.stringify(endorsementHeaders,null,2),
       businessHeaders: JSON.stringify(bizReqH),
       standardHeaders: JSON.stringify(stdReqH),
       requestBody: truncate(reqBody, 500),
@@ -244,16 +346,28 @@ function csvEscape(v) {
 
 function writeCsv(rows, filePath) {
   const headers = [
-    'Seq', 'Method', 'Initiator Type', 'Initiator URL',
-    'Host', 'URI', 'Full URL', 'Status', 'Status Text', 'Content-Type',
-    'Business Headers', 'Standard Headers', 'Request Body',
-    'Response Headers', 'Response Body',
-  ];
+  'Seq',
+  'Method',
+  'Initiator Type',
+  'Initiator URL',
+  'Host',
+  'URI',
+  'Full URL',
+  'Status',
+  'Status Text',
+  'Content-Type',
+  'Endorsement Headers',
+  'Business Headers',
+  'Standard Headers',
+  'Request Body',
+  'Response Headers',
+  'Response Body'
+];
   const lines = [headers.map(csvEscape).join(',')];
   rows.forEach((r) => {
     lines.push([
       r.seq, r.method, r.initiatorType, r.initiatorUrl,
-      r.host, r.uri, r.fullUrl, r.status, r.statusText, r.contentType,
+      r.host, r.uri, r.fullUrl, r.status, r.statusText, r.contentType,r.endorsementHeaders,
       r.businessHeaders, r.standardHeaders, r.requestBody,
       r.responseHeaders, r.responseBody,
     ].map(csvEscape).join(','));
@@ -262,71 +376,464 @@ function writeCsv(rows, filePath) {
 }
 
 function writeHtml(rows, filePath, title) {
-  const esc = (s) => String(s == null ? '' : s)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
 
-  const rowsHtml = rows.map((r) => `
-    <tr>
-      <td class="seq">${r.seq}</td>
-      <td><span class="method ${esc(r.method)}">${esc(r.method)}</span></td>
-      <td><span class="init ${esc(r.initiatorType)}">${esc(r.initiatorType)}</span></td>
-      <td class="url" title="${esc(r.initiatorUrl)}">${esc(truncate(r.initiatorUrl, 60))}</td>
-      <td class="url" title="${esc(r.fullUrl)}">${esc(r.uri)}</td>
-      <td>${esc(r.status)}</td>
-      <td>${esc(r.contentType)}</td>
-      <td class="code" title="${esc(r.businessHeaders)}">${esc(truncate(r.businessHeaders, 80))}</td>
-      <td class="code" title="${esc(r.standardHeaders)}">${esc(truncate(r.standardHeaders, 80))}</td>
-      <td class="code" title="${esc(r.requestBodyFull)}">${esc(r.requestBody)}</td>
-      <td class="code" title="${esc(r.responseBodyFull)}">${esc(r.responseBody)}</td>
-    </tr>`).join('');
+  const esc = (s) =>
+    String(s == null ? '' : s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
 
-  const html = `<!doctype html>
-<html><head><meta charset="utf-8"><title>${esc(title)}</title>
+  const cardsHtml = rows.map(r => `
+<div class="api-card"
+     data-search="${esc(JSON.stringify(r).toLowerCase())}">
+
+    <div class="api-header">
+
+        <div class="left">
+
+            <span class="method ${r.method}">
+                ${esc(r.method)}
+            </span>
+
+            <span class="status ${Number(r.status) < 300 ? 'success' : 'error'}">
+                ${esc(r.status)} ${esc(r.statusText)}
+            </span>
+
+            <span class="seq">
+                API #${r.seq}
+            </span>
+
+        </div>
+
+    </div>
+
+    <div class="endpoint">
+        ${esc(r.uri)}
+    </div>
+
+    <div class="meta-grid">
+
+        <div>
+            <label>Initiator Type</label>
+            <div>${esc(r.initiatorType)}</div>
+        </div>
+
+        <div>
+            <label>Initiator URL</label>
+            <div class="wrap">${esc(r.initiatorUrl)}</div>
+        </div>
+
+        <div>
+            <label>Host</label>
+            <div>${esc(r.host)}</div>
+        </div>
+
+        <div>
+            <label>Content Type</label>
+            <div>${esc(r.contentType)}</div>
+        </div>
+
+    </div>
+
+    <details>
+       <summary>
+          Business Request Headers
+       </summary>
+
+       <pre>${esc(r.businessHeaders)}</pre>
+    </details>
+
+    <details>
+       <summary>
+          Standard Request Headers
+       </summary>
+
+       <pre>${esc(r.standardHeaders)}</pre>
+    </details>
+
+    <details>
+       <summary>
+          Response Headers
+       </summary>
+
+       <pre>${esc(r.responseHeaders)}</pre>
+    </details>
+
+    <details>
+       <summary>
+          Request Body
+       </summary>
+
+       <pre class="json">
+${esc(r.requestBodyFull || '')}
+       </pre>
+
+    </details>
+
+    <details open>
+       <summary>
+          Response Body
+       </summary>
+
+       <pre class="json">
+${esc(r.responseBodyFull || '')}
+       </pre>
+
+    </details>
+
+</div>
+`).join('');
+
+
+  const html = `
+<!DOCTYPE html>
+<html>
+
+<head>
+
+<meta charset="utf-8"/>
+
+<title>${esc(title)}</title>
+
 <style>
-  body { font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 20px; background:#f7f8fa; }
-  h1 { font-size: 20px; margin-bottom: 4px; }
-  .meta { color:#666; margin-bottom:10px; font-size:13px; }
-  table { border-collapse: collapse; width:100%; background:#fff; font-size:12px; }
-  th, td { border:1px solid #e1e4e8; padding:6px 8px; vertical-align:top; text-align:left; }
-  th { background:#24292e; color:#fff; position:sticky; top:0; }
-  tr:nth-child(even) td { background:#fafbfc; }
-  td.seq { font-weight:700; color:#0366d6; text-align:center; }
-  td.code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size:11px; max-width:320px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  td.url { max-width: 320px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .method { padding:1px 6px; border-radius:4px; font-weight:600; color:#fff; font-size:11px; }
-  .method.GET{background:#61affe}.method.POST{background:#49cc90}
-  .method.PUT{background:#fca130}.method.PATCH{background:#50e3c2;color:#000}
-  .method.DELETE{background:#f93e3e}.method.OPTIONS{background:#0f6ab4}
-  .method.HEAD{background:#9012fe}
-  .init { padding:1px 6px; border-radius:4px; background:#eef; color:#333; font-size:11px; text-transform:lowercase; }
-  .init.xhr{background:#d7f1d5}.init.fetch{background:#ffe8b3}
-  .init.script{background:#e0d7ff}.init.parser{background:#d7ecff}
-  .init.preflight{background:#ffd7d7}.init.other{background:#eee}
-  input#filter { margin:8px 0; padding:6px 10px; width:340px; border:1px solid #ccc; border-radius:4px; }
-</style></head><body>
-<h1>${esc(title)} — API Sequence Report</h1>
-<div class="meta">${rows.length} REST calls &nbsp;|&nbsp; ordered by initiator (asc) then timestamp &nbsp;|&nbsp; generated ${new Date().toISOString()}</div>
-<input id="filter" placeholder="Filter sequence / method / URL / initiator..." />
-<table id="tbl">
-<thead><tr>
-  <th>Seq</th><th>Method</th><th>Initiator</th><th>Initiator URL</th><th>URI</th>
-  <th>Status</th><th>Content-Type</th>
-  <th>Business Headers</th><th>Standard Headers</th>
-  <th>Request Body</th><th>Response Body</th>
-</tr></thead>
-<tbody>${rowsHtml}</tbody>
-</table>
+
+*{
+ box-sizing:border-box;
+}
+
+body{
+ margin:0;
+ padding:0;
+ font-family:
+ "Segoe UI",
+ Arial,
+ sans-serif;
+ background:#f4f5f7;
+}
+
+/* HEADER */
+
+.header{
+
+ background:#1f2937;
+ color:white;
+ padding:20px;
+ position:sticky;
+ top:0;
+ z-index:999;
+}
+
+.header h1{
+ margin:0;
+ font-size:22px;
+}
+
+.search-container{
+
+ margin-top:15px;
+ display:flex;
+ gap:10px;
+ flex-wrap:wrap;
+}
+
+.search-box{
+
+ flex:1;
+ min-width:300px;
+ padding:12px;
+
+ border-radius:6px;
+ border:none;
+ font-size:14px;
+}
+
+/* SUMMARY */
+
+.summary{
+
+ display:flex;
+ gap:12px;
+ flex-wrap:wrap;
+ margin-top:12px;
+}
+
+.badge{
+
+ background:#374151;
+ color:white;
+
+ padding:8px 12px;
+ border-radius:5px;
+}
+
+/* CONTENT */
+
+.container{
+
+ max-width:1800px;
+ margin:auto;
+
+ padding:20px;
+}
+
+.api-card{
+
+ background:white;
+
+ border-radius:10px;
+ margin-bottom:20px;
+
+ box-shadow:
+ 0 2px 8px rgba(0,0,0,.1);
+
+ overflow:hidden;
+}
+
+/* CARD HEADER */
+
+.api-header{
+
+ background:#111827;
+ color:white;
+
+ padding:12px;
+ display:flex;
+ justify-content:space-between;
+ align-items:center;
+}
+
+.method{
+
+ padding:4px 10px;
+ border-radius:5px;
+
+ font-weight:bold;
+ color:white;
+}
+
+.GET{
+ background:#10b981;
+}
+
+.POST{
+ background:#3b82f6;
+}
+
+.PUT{
+ background:#f59e0b;
+}
+
+.DELETE{
+ background:#ef4444;
+}
+
+.PATCH{
+ background:#8b5cf6;
+}
+
+.status{
+
+ margin-left:10px;
+ padding:4px 10px;
+ border-radius:5px;
+}
+
+.success{
+ background:#059669;
+}
+
+.error{
+ background:#dc2626;
+}
+
+.seq{
+
+ margin-left:10px;
+ color:#d1d5db;
+}
+
+/* ENDPOINT */
+
+.endpoint{
+
+ padding:15px;
+
+ font-size:16px;
+ font-weight:600;
+
+ word-break:break-word;
+
+ background:#f9fafb;
+ border-bottom:1px solid #eee;
+}
+
+/* META */
+
+.meta-grid{
+
+ display:grid;
+
+ grid-template-columns:
+ repeat(auto-fit,minmax(250px,1fr));
+
+ gap:12px;
+
+ padding:15px;
+}
+
+.meta-grid label{
+
+ display:block;
+ font-weight:700;
+ margin-bottom:4px;
+}
+
+/* DETAILS */
+
+details{
+
+ border-top:1px solid #eee;
+}
+
+summary{
+
+ padding:14px;
+ font-weight:700;
+ cursor:pointer;
+ background:#fafafa;
+}
+
+pre{
+
+ margin:0;
+ padding:15px;
+
+ white-space:pre-wrap;
+ word-wrap:break-word;
+
+ overflow:auto;
+
+ background:#fafafa;
+
+ max-height:600px;
+
+ font-size:13px;
+}
+
+.json{
+
+ font-family:
+ Consolas,
+ monospace;
+}
+
+/* JSON SEARCH HIGHLIGHT */
+
+.highlight{
+
+ background:yellow;
+ color:black;
+}
+
+/* MOBILE */
+
+@media(max-width:768px){
+
+ .meta-grid{
+
+   grid-template-columns:1fr;
+ }
+
+ .header{
+
+   position:relative;
+ }
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="header">
+
+   <h1>${esc(title)}</h1>
+
+   <div class="search-container">
+
+      <input
+        id="globalSearch"
+        class="search-box"
+        placeholder="
+Search endpoint, header, property, status, value...
+">
+
+   </div>
+
+   <div class="summary">
+
+      <div class="badge">
+         APIs: ${rows.length}
+      </div>
+
+   </div>
+
+</div>
+
+<div class="container"
+     id="apiContainer">
+
+${cardsHtml}
+
+</div>
+
 <script>
-  document.getElementById('filter').addEventListener('input', (e) => {
-    const q = e.target.value.toLowerCase();
-    document.querySelectorAll('#tbl tbody tr').forEach((tr) => {
-      tr.style.display = tr.textContent.toLowerCase().includes(q) ? '' : 'none';
-    });
-  });
+
+const search =
+ document.getElementById(
+   'globalSearch'
+ );
+
+search.addEventListener(
+ 'input',
+ function(){
+
+   const text =
+      this.value
+        .toLowerCase()
+        .trim();
+
+   const cards =
+      document.querySelectorAll(
+        '.api-card'
+      );
+
+   cards.forEach(card=>{
+
+      const content =
+         card.dataset.search;
+
+      card.style.display =
+        content.includes(text)
+          ? ''
+          : 'none';
+   });
+ });
+
 </script>
-</body></html>`;
-  fs.writeFileSync(filePath, html, 'utf8');
+
+</body>
+
+</html>
+`;
+
+  fs.writeFileSync(
+     filePath,
+     html,
+     'utf8'
+  );
 }
 
 /* -------------------------- Postman building --------------------------- */
@@ -469,8 +976,27 @@ function main() {
   }
 
   const baseName = slugify(path.basename(inputPath, path.extname(inputPath)));
-  const outputDir = outArg ? path.resolve(outArg) : path.dirname(inputPath);
-  fs.mkdirSync(outputDir, { recursive: true });
+  // Example:
+// Nov11_QA2_PM-127036_uppercase_issue.har
+//
+// Output folder:
+// ./Nov11_QA2_PM-127036_uppercase_issue/
+
+const outputRoot = outArg
+  ? path.resolve(outArg)
+  : path.dirname(inputPath);
+
+const outputDir = path.join(
+  outputRoot,
+  path.basename(
+    inputPath,
+    path.extname(inputPath)
+  )
+);
+
+fs.mkdirSync(outputDir, {
+  recursive: true
+});
 
   const harText = fs.readFileSync(inputPath, 'utf8');
   let har;
